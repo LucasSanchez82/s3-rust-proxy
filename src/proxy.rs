@@ -64,6 +64,23 @@ async fn forward(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
+    // Detect AWS streaming SigV4 (aws-chunked). In this mode the SDK wraps each
+    // chunk with a size line and an embedded chunk-signature computed with the
+    // *client* credentials. The proxy must decode that wrapper before re-signing
+    // with its own credentials; otherwise the upstream receives an aws-chunked
+    // body whose embedded signatures don't match the proxy's Authorization header.
+    let is_aws_chunked = req
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("aws-chunked"))
+        .unwrap_or(false);
+    let decoded_content_length = req
+        .headers()
+        .get("x-amz-decoded-content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
     info!(
         op = op.label(),
         method = %method,
@@ -106,6 +123,11 @@ async fn forward(
         if should_strip_client_header(&lower) {
             continue;
         }
+        // Strip aws-chunked application-level encoding headers: the proxy decodes
+        // the body and forwards raw bytes, so these are no longer accurate.
+        if is_aws_chunked && matches!(lower.as_str(), "content-encoding" | "x-amz-decoded-content-length") {
+            continue;
+        }
         if encrypt && is_payload_integrity_header(&lower) {
             // Les checksums/MD5/Content-Length sont calculés par le client sur
             // le clair : ils ne correspondent plus au chiffré qu'on envoie.
@@ -122,10 +144,13 @@ async fn forward(
         http::header::HOST,
         http::HeaderValue::from_str(&cfg.upstream_host)?,
     );
-    // Recalcule un Content-Length cohérent avec la taille du chiffré.
+    // Recalcule un Content-Length cohérent avec la taille réelle du body.
     // Doit être inséré AVANT `sign_request`, qui signe ce header.
     if encrypt {
-        if let Some(plain_len) = content_length {
+        // Pour le chiffrement, la taille réelle du clair est soit la longueur
+        // décodée (aws-chunked), soit le Content-Length client ordinaire.
+        let plain_len = if is_aws_chunked { decoded_content_length } else { content_length };
+        if let Some(plain_len) = plain_len {
             let enc_len = crypto::encrypted_size(plain_len);
             upstream_headers.insert(
                 http::header::CONTENT_LENGTH,
@@ -137,13 +162,36 @@ async fn forward(
                 "encrypting upload without client Content-Length: upstream will likely reject"
             );
         }
+    } else if is_aws_chunked {
+        // Corps aws-chunked décodé : on utilise x-amz-decoded-content-length
+        // comme Content-Length pour que l'upstream connaisse la taille exacte.
+        if let Some(decoded_len) = decoded_content_length {
+            upstream_headers.insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(decoded_len),
+            );
+        } else {
+            warn!(
+                op = op.label(),
+                "aws-chunked upload without x-amz-decoded-content-length: upstream may reject"
+            );
+        }
     }
 
     // Conversion du body hyper -> reqwest::Body en streaming.
     // On compte les bytes *en clair* vus côté client — le compteur est
     // placé avant le chiffrement pour refléter ce que l'utilisateur envoie.
     let bytes_seen = Arc::new(AtomicU64::new(0));
-    let plain_stream = incoming_to_byte_stream(req.into_body(), Arc::clone(&bytes_seen));
+    let raw_stream = incoming_to_byte_stream(req.into_body(), Arc::clone(&bytes_seen));
+
+    // Si le client utilise le streaming SigV4 (aws-chunked), on décode le
+    // wrapper chunk avant de faire quoi que ce soit d'autre (chiffrement, etc.).
+    let plain_stream: ByteStream = if is_aws_chunked {
+        debug!(op = op.label(), "decoding aws-chunked body");
+        decode_aws_chunked(raw_stream)
+    } else {
+        raw_stream
+    };
 
     let upstream_stream: ByteStream = if encrypt {
         let key = cfg.encryption_key.as_ref().expect("guarded by `encrypt`");
@@ -350,6 +398,41 @@ fn incoming_to_byte_stream(incoming: Incoming, bytes_seen: Arc<AtomicU64>) -> By
         .map_err(|e: hyper::Error| std::io::Error::new(std::io::ErrorKind::Other, e));
 
     Box::pin(stream)
+}
+
+/// Decode an aws-chunked body (application-level, not HTTP chunked).
+///
+/// Format: `<hex_size>[;chunk-extension...]\r\n<data>\r\n` repeated, ending
+/// with `0[;...]\r\n\r\n`. The chunk-signature extension is emitted by the AWS
+/// SDK when using streaming SigV4 and contains the client's credentials — we
+/// drop the entire wrapper and yield only the raw payload bytes.
+fn decode_aws_chunked(input: ByteStream) -> ByteStream {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    use tokio_util::io::StreamReader;
+
+    Box::pin(async_stream::try_stream! {
+        let mut reader = BufReader::new(StreamReader::new(input));
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
+            let hex_part = trimmed.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(hex_part, 16)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad aws-chunk size '{}': {}", hex_part, e)))?;
+            if size == 0 {
+                break;
+            }
+            let mut data = vec![0u8; size];
+            reader.read_exact(&mut data).await?;
+            yield Bytes::from(data);
+            // Skip the trailing \r\n after chunk data
+            let mut crlf = [0u8; 2];
+            reader.read_exact(&mut crlf).await?;
+        }
+    })
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
