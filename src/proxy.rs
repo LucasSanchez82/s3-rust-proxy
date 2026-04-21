@@ -359,6 +359,10 @@ fn should_strip_client_header(lower: &str) -> bool {
             | "te"
             | "trailer"
             | "upgrade"
+            // Expect: 100-continue is a one-hop directive. Many S3-compatible backends
+            // strip it before verifying the signature, so forwarding it causes
+            // SignatureDoesNotMatch on large uploads (UploadPart, big PutObject).
+            | "expect"
     )
 }
 
