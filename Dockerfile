@@ -15,7 +15,7 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 RUN rm -rf src
 
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN touch src/main.rs && cargo build --release --target x86_64-unknown-linux-musl
 
 FROM scratch
 
